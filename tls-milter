@@ -1,0 +1,425 @@
+#!/usr/bin/perl
+#
+# Milter to check if enforced TLS delivery of outbound mail is possible.
+#
+# Mail with a RCPT TO address with a prepended s: (as in secure, compare
+# to https) e.g.: "s:user@domain.cc", will have it's domain part checked against
+# this systems tls_policy file, if the domain matches an entry in tls_policy, the
+# result from the tls_policy database is checked for a TLS policy of atleast
+# "verify" or "secure".
+#
+# If the above tests passes, the prepended "s:" is removed from the RCPT TO 
+# address and the mail is passed back to postfix for further processing.
+#
+# If any of the above tests fails, a NDR (non-delivery report) is generated
+# which informs the sending user that secure communication isn't available
+# for this domain.
+#
+# This code includes code from Mark Kramer <admin@asarian-host.net> (sendmail-milter)
+# and code from paulv@bikkel.org (milter_archive).
+#
+# When       Who          What
+# 2010-08-25 f@xpd.se     created.
+#
+
+#
+# TODO:
+#
+
+#
+# Config
+#
+
+my $TLS_MILTER_SOCKET		= "inet:3333@localhost";	# Socket to listen on
+my $TLS_POLICY_FILE		= "/etc/postfix/tls_policy.db";	# Postfix TLS policy file in BerkeleyDB hash format
+my $TLS_MILTER_LOG		= POSIX::strftime("/var/tls-milter/tls-milter-%Y-%m.log", localtime); # Name of logfile
+
+# In a NDR, the below URL should guide the user to more information.
+my $TLS_INFO_URL		= "http://intranet.skatteverket.se/enforced_tls_not_possible.html";
+my $TLS_STRICT_MODE		= 1; # If a destination for an enforced TLS recipient (s:user@domain.cc) fails policy check, reject mail.
+my $TLS_UNIFIED_DELIVERY	= 0; # If not all destinations supports enforced TLS, when enforcing at least one recipient, reject mail.
+my $TLS_X_HEADER		= 1; # Add the X-TLS header
+
+#
+# End of configurable parameters
+#
+
+use POSIX;
+use Sendmail::Milter;
+use Socket;
+use Getopt::Long;
+use BerkeleyDB;
+use strict;
+
+my $debug=0;
+my $verbose=0;
+my %tls_domains;
+my ($user, $pid, $login, $pass, $uid, $gid);
+my $usage = "Usage: " . $0 . " [-d|--debug] [-v|--verbose] user-to-run-as\n";
+
+sub write_log : locked
+{
+	print STDERR "tls-milter: @_\n";
+	open(TLSLOG, "+>>" . $TLS_MILTER_LOG) || (warn "$0: unable to write to $TLS_MILTER_LOG: $!" && return);
+	print TLSLOG localtime() . ": @_\n";
+	close TLSLOG;
+}
+
+sub fatal : locked
+{
+	print STDERR "tls-milter: @_\n";
+	write_log(@_);
+	exit 1;
+}
+
+sub connect_callback : locked
+{
+	my $ctx = shift;
+	my $priv_data = {};
+	$priv_data->{'hostname'} = shift;
+	my $sockaddr_in = shift;
+
+	if (defined $sockaddr_in) {
+		my ($port, $ip, $srcip);
+		eval {
+			($port, $ip) = sockaddr_in($sockaddr_in);
+			$srcip = inet_ntoa($ip);
+		};
+		$priv_data->{'port'} = $port;
+		$priv_data->{'srcip'} = $srcip;
+	} else {
+		$priv_data->{'port'} = "n/a";
+		$priv_data->{'srcip'} = "n/a";
+	}
+	write_log("DEBUG: hostname = " . $priv_data->{'hostname'} . ", IP: " . $priv_data->{'srcip'} . ":" . $priv_data->{'port'}) if ($debug > 1);
+
+	$ctx->setpriv($priv_data);
+
+	return SMFIS_CONTINUE;
+}
+
+sub envfrom_callback : locked
+{
+	my $ctx = shift;
+	my @args = @_;
+	my $priv_data = $ctx->getpriv();
+
+	$priv_data->{'from'} = join(', ', @args);
+	write_log("DEBUG: MAIL FROM: " . $priv_data->{'from'}) if ($debug > 0);
+	$ctx->setpriv($priv_data);
+
+	return SMFIS_CONTINUE;
+}
+
+sub envrcpt_callback : locked
+{
+	my $ctx = shift;
+	my @args = @_;
+	my @rcpts = ();
+	my $priv_data = $ctx->getpriv();
+
+	write_log("DEBUG: RCPT TO: " . join(', ', @args)) if ($debug > 0);
+
+	if (defined $priv_data->{'rcpts'}) {
+		@rcpts = @{$priv_data->{'rcpts'}};
+	}
+	push @rcpts, (join(', ', @args));
+	$priv_data->{'rcpts'} = \@rcpts;
+	$ctx->setpriv($priv_data);
+
+	return SMFIS_CONTINUE;
+}
+
+sub header_callback : locked
+{
+	my $ctx = shift;
+	my $headerf = shift;
+	my $headerv = shift;
+	my $priv_data = $ctx->getpriv();
+	my @hdrs = ();
+
+	write_log("DEBUG: " . $headerf . ": " . $headerv) if ($debug > 2);
+
+	if ($headerf =~ /^X-TLS$/) {
+		$priv_data->{'x-tls'} = $headerv if ($TLS_X_HEADER);
+		write_log("DEBUG: Existing X-TLS header detected 'X-TLS: " . $headerv . "'") if ($debug > 1);
+	}
+
+	if (defined $priv_data->{'hdrs'}) {
+		@hdrs = @{$priv_data->{'hdrs'}};
+	}
+	push @hdrs, $headerf . ": " . $headerv;
+	$priv_data->{'hdrs'} = \@hdrs;
+
+	$ctx->setpriv($priv_data);
+	return SMFIS_CONTINUE;
+}
+
+sub eom_callback : locked
+{
+	my $ctx = shift;
+	my $priv_data = $ctx->getpriv();
+	my ($enforce_tls, $to, $domain);
+	my $error="";
+	my $tls_enforced=0;
+	my $tls_required=0;
+	my @tls_failed=();
+	my @tls_ok=();
+	my @tls_del_rcpt=();
+	my @tls_chg_rcpt=();
+
+	# Process all recipients (from RCPT TO in envelope)
+	foreach my $rcpt (@{$priv_data->{'rcpts'}}) {
+		# Match any RCPT TO w. a prepended s:, e.g. <s:user@, <"s:user"@, s:user and "s:user"
+		($enforce_tls, $to, $domain) = ($rcpt =~ /<?"?(s:)(.*?)"?@([[:alnum:].-]*)>?/);
+		if ($enforce_tls) {
+			# Secure delivery for recipient is processed here, e.g. <s:user@domain.cc>
+			$tls_required++; # tls required set
+			if (enforced_tls_to($domain)) {
+				$tls_enforced++; # required and possible
+				push @tls_ok, $domain; # marks domain as ok for enforced tls
+				push @tls_del_rcpt, $rcpt; # for later header cleanup
+				push @tls_chg_rcpt, ($to . "@" . $domain); # for later header cleanup
+			} else {
+				push @tls_failed, $domain; # required, but not possible
+			}
+		} else {
+			# Normal delivery for recipient is processed here, e.g. <user@domain.cc>
+			($to, $domain) = ($rcpt =~ /^<?(.*)@([[:alnum:].-]*)>?/);
+			write_log("ERROR: Could not match RCPT TO on non-enforced mail. (" . $rcpt . ")") if (not $to);
+			if (enforced_tls_to($domain)) { # Check if we can do enforced TLS on a non-enforced address
+				$tls_enforced++; # TLS possible
+				push @tls_ok, $domain; # add domain to list of TLS destinations
+			}
+		}
+	}
+
+	# Add an optional X-TLS header
+	if (@tls_ok) {
+		if ($TLS_X_HEADER) {
+			my $header = 'Secure delivery enabled to ' . '"' . join('", "', @tls_ok) . '"';
+			if ((not defined $priv_data->{'x-tls'}) || # Dont add a duplicate X-TLS header
+			    (defined     $priv_data->{'x-tls'} &&
+			                 $priv_data->{'x-tls'} ne $header)) {
+				$ctx->addheader('X-TLS', $header) or
+					write_log("WARNING: can't add header: X-TLS: " . $header);
+			}
+		}
+	}
+
+	# None of the recipients was flagged for enforced TLS delivery, carry on
+	if (not $tls_required) {
+		write_log('Doing automatic enforced TLS to "' . join('", "', @tls_ok) . '"') if (@tls_ok && $verbose);
+		$ctx->setpriv(undef);
+		return SMFIS_CONTINUE;
+	}
+
+	#
+	# TLS was enabled for at least one recipient
+	#
+
+	# but some domain/s wasn't valid for enforced TLS delivery
+	if (@tls_failed) {
+		$error = "Enforced TLS is not possible to the domain" .
+			(scalar @tls_failed > 1 ? "s " : " ") . '"' . join('", "', @tls_failed) . '"';
+		if ($TLS_STRICT_MODE) { # Normally enforced, aka ON
+			write_log($error . ". Entire mail was rejected.");
+			$ctx->setreply('550', '5.5.0', $error . ". Mail was not delivered. For more information, please see $TLS_INFO_URL");
+			return SMFIS_REJECT;
+		} else { # "loose" mode, don't think this is desireable, sender will not find out about "problem".
+			write_log($error . ", but loose mode enabled, deliver anyway.");
+		}
+	}
+
+	# If TLS is enforced for one recipient, ALL recipient have to be TLS if unified delivery is enabled. OFF by default.
+	if (scalar @{$priv_data->{'rcpts'}} != $tls_enforced) {
+		$error = "TLS was not possible to all recipients";
+		if ($TLS_UNIFIED_DELIVERY) {
+			write_log($error);
+			$ctx->setreply('550', '5.5.0', $error . ". Mail was not delivered. For more information, please see $TLS_INFO_URL");
+			return SMFIS_REJECT;
+		} else {
+			write_log($error . ", but non-unified delivery enabled, deliver anyway.");
+		}
+	}
+
+	# If we have any addresses with prepended s:, process headers and RCPT TO
+	if (@tls_chg_rcpt) {
+		# Strip of any prepended s: from the To: and Cc: header
+		foreach my $hdr (@{$priv_data->{'hdrs'}}) {
+			my ($hdrf, $hdrv) = ($hdr =~ /^(.*): (.*)/s);
+			if ($hdrf =~ /^To$/ || $hdrf =~ /^Cc$/) {
+				foreach my $rcpt (@tls_chg_rcpt) {
+					($to, $domain) = ($rcpt =~ /^(.*)@(.*)$/);
+					my $rcpt_re = '["]?s:' . $to . '["]?@' . $domain;
+					$hdrv =~ s/$rcpt_re/$rcpt/sg if ($hdrv =~ /$rcpt_re/s);
+				}
+				$ctx->chgheader($hdrf, 1, $hdrv);
+			}
+		}
+
+		#
+		# Finally remove prepended s: from any RCPT TO recipients
+		#
+
+		# First delete the old RCPT TO (e.g. RCPT TO: <s:user@domain.cc>
+		foreach my $rcpt (@tls_del_rcpt) {
+			my ($header) = ($rcpt =~ /(<?"?s:.*?"?@[[:alnum:].-]*>?)/);
+			$ctx->delrcpt($header) or write_log("WARNING: failed to remove RCPT TO: " . $header);
+		}
+
+		# Add a new RCPT TO w/o the prepended s: (e.g. RCPT TO: <user@domain.cc>, failure here is fatal, so reject.
+		foreach my $rcpt (@tls_chg_rcpt) {
+			if (not $ctx->addrcpt(("<" . $rcpt . ">"))) {
+				write_log("ERROR: failed to add RCPT TO: " . $rcpt . ", rejecting mail.");
+				return SMFIS_REJECT;
+			}
+		}
+
+		write_log('Done processing mail to "' . join('", "', @tls_chg_rcpt) . '"') if ($verbose);
+	}
+
+	$ctx->setpriv(undef);
+	return SMFIS_CONTINUE;
+}
+
+sub close_callback : locked
+{
+	my $ctx = shift;
+	$ctx->setpriv(undef);
+	return SMFIS_CONTINUE;
+}
+
+sub enforced_tls_to($) : locked
+{
+	return 0 if (not defined $tls_domains{$_[0]});
+
+	if ($tls_domains{$_[0]} =~ /verify.*/ || $tls_domains{$_[0]} =~ /secure.*/) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub fetch_tls_policy : locked
+{
+	my %hash;
+	my $db = tie %hash, 'BerkeleyDB::Hash',
+		-Filename => $TLS_POLICY_FILE,
+		-Flags => DB_RDONLY
+		or fatal("ERROR: can't read file '$TLS_POLICY_FILE'");
+
+	$db->filter_fetch_key	( sub { s/\0$// } );
+	$db->filter_store_key	( sub { $_ .= "\0" } );
+	$db->filter_fetch_value	( sub { s/\0$// } );
+	$db->filter_store_value	( sub { $_ .= "\0" } );
+
+	%tls_domains = ();
+	%tls_domains = %hash;
+	write_log("fetched " . keys(%tls_domains) . " domains from '$TLS_POLICY_FILE'.");
+	untie %hash;
+}
+
+my %my_callbacks =
+(
+	'connect' =>	\&connect_callback,
+	'envfrom' =>	\&envfrom_callback,
+	'envrcpt' =>	\&envrcpt_callback,
+        'header' =>     \&header_callback,
+	'eom' =>	\&eom_callback,
+	'abort' =>	\&close_callback,
+	'close' =>	\&close_callback,
+);
+
+#
+# Main code
+#
+
+GetOptions("d+"		=> \$debug,
+	   "debug"	=> \$debug,
+	   "v+"		=> \$verbose,
+	   "verbose"	=> \$verbose);
+die $usage if $Getopt::Long::error;
+$user=shift;
+$verbose=1 if ($debug);
+die $usage if (not $user);
+if ($>) {
+	fatal("You need to start $0 as root.");
+}
+
+# Get info on the user we want to run as. If $uid is undefined, the user
+# does not exist on the system; if zero, it is the UID of root.
+($login, $pass, $uid, $gid) = getpwnam ($user);
+if (not defined ($uid)) {
+	fatal("$user is not a valid user on this system.");
+} elsif (not $uid) {
+	fatal("You cannot run tls-milter as root.");
+}
+
+# Since we will daemonize, play nice.
+chdir ('/') or fatal("can not change directory to /");
+open (STDIN, '/dev/null');
+open (STDOUT, '>/dev/null');
+umask (0077);
+
+if (not (-e '/var/tls-milter')) {
+	fatal("Odd; cannot create /var/tls-milter/") if (not mkdir '/var/tls-milter');
+}
+
+# Fork and give us a pid file.
+if ($pid = fork ()) {
+    open (USERLOG, ">".'/var/tls-milter/tls-milter.pid') or fatal("can not create pidfile.");
+    flock (USERLOG, 2);
+    seek (USERLOG, 0, 0);
+    print USERLOG " $pid";
+    close (USERLOG);
+    exit 0;
+}
+
+# Complete de daemonization process.
+POSIX::setsid() or fatal("POSIX::setsid() failed.");
+open (STDERR, '>&STDOUT');
+
+if (not Sendmail::Milter::setconn($TLS_MILTER_SOCKET)) {
+	fatal("Failed to detect connection information.");
+}
+
+if (not Sendmail::Milter::register($ARGV[0], \%my_callbacks, SMFI_CURR_ACTS)) {
+	fatal("Failed to register callbacks for $ARGV[0].");
+}
+
+# Set all proper permissions/ownerships, according to the user we run as.
+if ((not chown $uid, $gid, '/var/tls-milter', glob ('/var/tls-milter/*')) ||
+	(not chmod 0700, '/var/tls-milter')) {
+	fatal("Cannot set proper permissions.");
+}
+
+# Drop the Sendmail::Milter privileges
+$) = $gid;
+$( = $gid;
+$> = $uid;
+$< = $uid;
+
+# Give us a pretty proc-title to look at in 'ps ax'. :)
+$0 = 'tls-milter: TLS Enforcer';
+
+# Grab the content of the tls_policy file, to find which domains we can enforce TLS to.
+&fetch_tls_policy();
+
+write_log("Starting Sendmail::Milter $Sendmail::Milter::VERSION engine.");
+
+# Fire away
+if (Sendmail::Milter::main()) {
+	write_log("Successful exit from the Sendmail::Milter engine.");
+} else {
+	write_log("Unsuccessful exit from the Sendmail::Milter engine.");
+}
+
+END {
+	# On exit (child only!) we clean up the mess.
+	if (not $pid) {
+		unlink ('/var/tls-milter/tls-milter.pid');
+	}
+}
+
+exit;
