@@ -1,0 +1,49 @@
+Due to the way postfix currently handles addrcpt (hardcoded to treat
+it as a BCC), DSN should be disabled on the gateway to get non-delivery
+reports (NDR) to work.
+
+Either turn it off completely, by specifying
+
+smtpd_discard_ehlo_keywords		= dsn
+
+Or selectivly by using a map
+
+smtpd_discard_ehlo_keyword_address_maps	= cidr:smtp_discard_helo
+
+$ cat smtp_discard_helo
+127.0.0.1/32		dsn
+192.168.248.12/32	dsn
+
+For reference:
+
+From: Wietse Venema <wietse@porcupine.org>
+Subject: Re: Why does postfix (2.6.1, 2.7.0) force NOTIFY=NEVER when i change a RCPT TO: from a milter?
+Date: 24 september 2010 14.00.22 CEST
+To: Postfix users <postfix-users@postfix.org>
+
+Fredrik Söderblom:
+> Hi,
+>
+> Why does postfix (2.6.1, 2.7.0) force NOTIFY=NEVER when i change
+> a RCPT TO: from a milter?
+
+I haven't seen any no documentation on what the recipient attributes
+of addrcpt should be. In the absence of that, Postfix maintains
+consistency with other Postfix features that add BCC recipients
+(namely, always_bcc, sender_bcc_maps and recipient_bcc_maps).
+
+Of course, any hard-coded policy should be made configurable,
+but that does not help you now.
+
+You can shut up Postfix about DSN attributes with:
+
+/etc/postfix/main.cf:
+   smtp_discard_ehlo_keywords = dsn
+
+or an equivalent smtp_discard_ehlo_keyword_address_maps setting.
+
+This means that down-stream MTAs will send delivery status
+notifications. The local Postfix instance will not send notifications
+until NOTIFY is made configurable for addrcpt and other BCC features.
+
+	Wietse
